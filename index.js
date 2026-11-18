@@ -1,12 +1,13 @@
 require("dotenv").config({ quiet: true });
 const express = require("express");
 const cors = require("cors");
-const mysql = require("mysql2/promise");
+const { Pool } = require("pg");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const scrypt = promisify(crypto.scrypt);
 
@@ -14,19 +15,23 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" })); // photo / file uploads come as base64
 
-// ---- MySQL connection (values come from the .env file) ----
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || "arinfotek",
-  waitForConnections: true,
-  connectionLimit: 5,
+// ---- Neon PostgreSQL connection (DATABASE_URL from Vercel / .env) ----
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
-const UPLOAD_DIR = path.join(__dirname, "uploads"); // uploaded files are saved here
+// Use /tmp in Vercel serverless environment since root folder is read-only
+const UPLOAD_DIR = process.env.VERCEL
+  ? path.join(os.tmpdir(), "uploads")
+  : path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Health check route for browser testing
+app.get("/", (req, res) => {
+  res.json({ status: "OK", message: "AR Infotek Backend is running on Vercel + Neon!" });
+});
 
 // Checks the login token sent by the app
 function auth(req, res, next) {
@@ -42,7 +47,13 @@ function auth(req, res, next) {
 
 // Date -> "16 Nov 2026, 5:30 pm" (India time)
 function fmt(d) {
-  return d ? new Date(d).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" }) : null;
+  return d
+    ? new Date(d).toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        dateStyle: "medium",
+        timeStyle: "short",
+      })
+    : null;
 }
 
 // Hash the password (never store the real password)
@@ -66,7 +77,7 @@ const REQUIRED = [
   "address", "degree", "department", "degree_status", "course", "gender", "skills",
 ];
 
-// ---- POST /register : same behaviour as the Flask version ----
+// ---- POST /register ----
 app.post("/register", async (req, res) => {
   const d = req.body || {};
 
@@ -85,12 +96,12 @@ app.post("/register", async (req, res) => {
   try {
     const passwordHash = await hashPassword(String(d.password));
 
-    await pool.execute(
+    await pool.query(
       `INSERT INTO registrations
         (full_name, email, phone, password_hash, college, register_no, city, address,
          degree, department, degree_status, year_of_study, semester, completion_year,
          course, gender, skills)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
       [
         d.full_name, d.email, d.phone, passwordHash, d.college, d.register_no, d.city,
         d.address, d.degree, d.department, d.degree_status,
@@ -101,7 +112,7 @@ app.post("/register", async (req, res) => {
 
     return res.status(201).json({ message: "Registered" });
   } catch (e) {
-    if (e.code === "ER_DUP_ENTRY") {
+    if (e.code === "23505") {
       return res.status(409).json({ error: "This email or phone is already registered" });
     }
     console.error("DB error:", e.message);
@@ -119,16 +130,16 @@ app.post("/login", async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.execute(
-      "SELECT id, full_name, password_hash FROM registrations WHERE email = ? OR phone = ? LIMIT 1",
+    const { rows } = await pool.query(
+      "SELECT id, full_name, password_hash FROM registrations WHERE email = $1 OR phone = $2 LIMIT 1",
       [username, username]
     );
     const user = rows[0];
     const ok = user ? await verifyPassword(password, user.password_hash) : false;
 
-    // store the login attempt (linked to the registration by foreign key)
-    await pool.execute(
-      "INSERT INTO login_history (registration_id, username_entered, status) VALUES (?,?,?)",
+    // store the login attempt
+    await pool.query(
+      "INSERT INTO login_history (registration_id, username_entered, status) VALUES ($1,$2,$3)",
       [user ? user.id : null, username.slice(0, 100), ok ? "SUCCESS" : "FAILED"]
     );
 
@@ -145,27 +156,33 @@ app.post("/login", async (req, res) => {
 
 // ================= STUDENT PROFILE =================
 
-// GET /profile : registration details + profile + login details + files
+// GET /profile
 app.get("/profile", auth, async (req, res) => {
   try {
-    const [regs] = await pool.execute(
+    const { rows: regs } = await pool.query(
       `SELECT id, full_name, email, phone, college, register_no, city, address, degree, department,
               degree_status, year_of_study, semester, completion_year, course, gender, skills, created_at
-       FROM registrations WHERE id = ?`, [req.userId]);
+       FROM registrations WHERE id = $1`,
+      [req.userId]
+    );
     if (!regs.length) return res.status(404).json({ error: "User not found" });
 
-    const [prof] = await pool.execute(
-      "SELECT photo, location, current_activity, current_course FROM student_profile WHERE registration_id = ?",
-      [req.userId]);
-    const [stats] = await pool.execute(
-      "SELECT COUNT(*) AS total, MAX(login_time) AS last_login FROM login_history WHERE registration_id = ? AND status = 'SUCCESS'",
-      [req.userId]);
-    const [recent] = await pool.execute(
-      "SELECT status, login_time FROM login_history WHERE registration_id = ? ORDER BY id DESC LIMIT 5",
-      [req.userId]);
-    const [files] = await pool.execute(
-      "SELECT id, file_name, file_size, uploaded_at FROM student_files WHERE registration_id = ? ORDER BY id DESC",
-      [req.userId]);
+    const { rows: prof } = await pool.query(
+      "SELECT photo, location, current_activity, current_course FROM student_profile WHERE registration_id = $1",
+      [req.userId]
+    );
+    const { rows: stats } = await pool.query(
+      "SELECT COUNT(*) AS total, MAX(login_time) AS last_login FROM login_history WHERE registration_id = $1 AND status = 'SUCCESS'",
+      [req.userId]
+    );
+    const { rows: recent } = await pool.query(
+      "SELECT status, login_time FROM login_history WHERE registration_id = $1 ORDER BY id DESC LIMIT 5",
+      [req.userId]
+    );
+    const { rows: files } = await pool.query(
+      "SELECT id, file_name, file_size, uploaded_at FROM student_files WHERE registration_id = $1 ORDER BY id DESC",
+      [req.userId]
+    );
 
     const reg = regs[0];
     reg.created_at = fmt(reg.created_at);
@@ -178,7 +195,12 @@ app.get("/profile", auth, async (req, res) => {
         last: fmt(stats[0].last_login),
         recent: recent.map((r) => ({ status: r.status, login_time: fmt(r.login_time) })),
       },
-      files: files.map((f) => ({ id: f.id, file_name: f.file_name, file_size: f.file_size, uploaded_at: fmt(f.uploaded_at) })),
+      files: files.map((f) => ({
+        id: f.id,
+        file_name: f.file_name,
+        file_size: f.file_size,
+        uploaded_at: fmt(f.uploaded_at),
+      })),
     });
   } catch (e) {
     console.error("DB error:", e.message);
@@ -200,22 +222,37 @@ app.put("/profile", auth, async (req, res) => {
   }
 
   try {
-    await pool.execute(
-      "UPDATE registrations SET full_name=?, phone=?, college=?, city=?, address=?, course=? WHERE id=?",
-      [String(d.full_name).trim(), d.phone, String(d.college).trim(), String(d.city).trim(),
-       String(d.address).trim(), d.course, req.userId]);
+    await pool.query(
+      "UPDATE registrations SET full_name=$1, phone=$2, college=$3, city=$4, address=$5, course=$6 WHERE id=$7",
+      [
+        String(d.full_name).trim(),
+        d.phone,
+        String(d.college).trim(),
+        String(d.city).trim(),
+        String(d.address).trim(),
+        d.course,
+        req.userId,
+      ]
+    );
 
-    await pool.execute(
+    await pool.query(
       `INSERT INTO student_profile (registration_id, location, current_activity, current_course)
-       VALUES (?,?,?,?)
-       ON DUPLICATE KEY UPDATE location = VALUES(location),
-         current_activity = VALUES(current_activity), current_course = VALUES(current_course)`,
-      [req.userId, String(d.location ?? "").trim() || null,
-       String(d.current_activity ?? "").trim() || null, String(d.current_course ?? "").trim() || null]);
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (registration_id) DO UPDATE SET
+         location = EXCLUDED.location,
+         current_activity = EXCLUDED.current_activity,
+         current_course = EXCLUDED.current_course`,
+      [
+        req.userId,
+        String(d.location ?? "").trim() || null,
+        String(d.current_activity ?? "").trim() || null,
+        String(d.current_course ?? "").trim() || null,
+      ]
+    );
 
     return res.json({ message: "Profile updated" });
   } catch (e) {
-    if (e.code === "ER_DUP_ENTRY") return res.status(409).json({ error: "This phone number is already used" });
+    if (e.code === "23505") return res.status(409).json({ error: "This phone number is already used" });
     console.error("DB error:", e.message);
     return res.status(500).json({ error: "Database error" });
   }
@@ -229,9 +266,11 @@ app.post("/profile/photo", auth, async (req, res) => {
     return res.status(400).json({ error: "Please choose a valid photo (JPEG, small size)" });
   }
   try {
-    await pool.execute(
-      `INSERT INTO student_profile (registration_id, photo) VALUES (?,?)
-       ON DUPLICATE KEY UPDATE photo = VALUES(photo)`, [req.userId, image]);
+    await pool.query(
+      `INSERT INTO student_profile (registration_id, photo) VALUES ($1,$2)
+       ON CONFLICT (registration_id) DO UPDATE SET photo = EXCLUDED.photo`,
+      [req.userId, image]
+    );
     return res.json({ message: "Photo updated" });
   } catch (e) {
     console.error("DB error:", e.message);
@@ -239,7 +278,7 @@ app.post("/profile/photo", auth, async (req, res) => {
   }
 });
 
-// POST /profile/files : { file_name, data: "<base64>" }  -> saved in uploads/<id>/
+// POST /profile/files : { file_name, data: "<base64>" }
 app.post("/profile/files", auth, async (req, res) => {
   const name = String(req.body?.file_name ?? "").trim();
   const buf = Buffer.from(String(req.body?.data ?? ""), "base64");
@@ -258,9 +297,10 @@ app.post("/profile/files", auth, async (req, res) => {
     const stored = `${Date.now()}_${safe}`;
     fs.writeFileSync(path.join(folder, stored), buf);
 
-    await pool.execute(
-      "INSERT INTO student_files (registration_id, file_name, file_path, file_size) VALUES (?,?,?,?)",
-      [req.userId, name.slice(0, 150), `uploads/${req.userId}/${stored}`, buf.length]);
+    await pool.query(
+      "INSERT INTO student_files (registration_id, file_name, file_path, file_size) VALUES ($1,$2,$3,$4)",
+      [req.userId, name.slice(0, 150), `uploads/${req.userId}/${stored}`, buf.length]
+    );
     return res.status(201).json({ message: "File uploaded" });
   } catch (e) {
     console.error("Upload error:", e.message);
@@ -271,12 +311,15 @@ app.post("/profile/files", auth, async (req, res) => {
 // DELETE /profile/files/:id
 app.delete("/profile/files/:id", auth, async (req, res) => {
   try {
-    const [rows] = await pool.execute(
-      "SELECT file_path FROM student_files WHERE id = ? AND registration_id = ?", [req.params.id, req.userId]);
+    const { rows } = await pool.query(
+      "SELECT file_path FROM student_files WHERE id = $1 AND registration_id = $2",
+      [req.params.id, req.userId]
+    );
     if (!rows.length) return res.status(404).json({ error: "File not found" });
 
-    fs.rmSync(path.join(__dirname, rows[0].file_path), { force: true });
-    await pool.execute("DELETE FROM student_files WHERE id = ?", [req.params.id]);
+    const baseDir = process.env.VERCEL ? os.tmpdir() : __dirname;
+    fs.rmSync(path.join(baseDir, rows[0].file_path), { force: true });
+    await pool.query("DELETE FROM student_files WHERE id = $1", [req.params.id]);
     return res.json({ message: "File deleted" });
   } catch (e) {
     console.error("DB error:", e.message);
@@ -285,33 +328,34 @@ app.delete("/profile/files/:id", auth, async (req, res) => {
 });
 
 // ================= ATTENDANCE (calendar + holidays + GPS check) =================
-const ACCURACY_LIMIT_M = 30;                          // GPS must be at least this accurate
-const BLOCK_MOCK = process.env.BLOCK_MOCK === "true"; // set BLOCK_MOCK=true in .env to reject fake-GPS apps
+const ACCURACY_LIMIT_M = 30;
+const BLOCK_MOCK = process.env.BLOCK_MOCK === "true";
 const pad = (n) => String(n).padStart(2, "0");
 
-// Distance between two GPS points in metres (Haversine formula)
 function distanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const rad = (x) => (x * Math.PI) / 180;
   const dLat = rad(lat2 - lat1);
   const dLon = rad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// Today's date in India time, like 2026-11-17
 function todayIST() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
-// 0 = Sunday ... 6 = Saturday for a "YYYY-MM-DD" date
 function weekday(dateStr) {
   return new Date(`${dateStr}T00:00:00Z`).getUTCDay();
 }
 
-// Public holiday or Saturday / Sunday?  Returns the reason, or "" for a working day
 async function offReason(day) {
-  const [h] = await pool.execute("SELECT name FROM public_holidays WHERE holiday_date = ?", [day]);
+  const { rows: h } = await pool.query(
+    "SELECT name FROM public_holidays WHERE holiday_date = $1",
+    [day]
+  );
   if (h.length) return `Today is a public holiday: ${h[0].name}`;
   const dow = weekday(day);
   if (dow === 0) return "Today is Sunday (weekly off)";
@@ -319,34 +363,48 @@ async function offReason(day) {
   return "";
 }
 
-// GET /attendance/calendar?year=2026&month=11 : every day of the month with its colour type
+// GET /attendance/calendar?year=2026&month=11
 app.get("/attendance/calendar", auth, async (req, res) => {
   const today = todayIST();
   const year = Number(req.query.year) || Number(today.slice(0, 4));
   const month = Number(req.query.month) || Number(today.slice(5, 7));
-  if (!Number.isInteger(year) || !Number.isInteger(month) || year < 2000 || year > 2100 || month < 1 || month > 12) {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    year < 2000 ||
+    year > 2100 ||
+    month < 1 ||
+    month > 12
+  ) {
     return res.status(400).json({ error: "Invalid month" });
   }
 
   try {
-    const [crows] = await pool.execute("SELECT company_name, radius_m FROM company_location ORDER BY id LIMIT 1");
-    if (!crows.length) return res.status(500).json({ error: "Company location is not set in the database" });
+    const { rows: crows } = await pool.query(
+      "SELECT company_name, radius_m FROM company_location ORDER BY id LIMIT 1"
+    );
+    if (!crows.length)
+      return res.status(500).json({ error: "Company location is not set in the database" });
 
-    const [reg] = await pool.execute(
-      "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS joined FROM registrations WHERE id = ?", [req.userId]);
+    const { rows: reg } = await pool.query(
+      "SELECT TO_CHAR(created_at, 'YYYY-MM-DD') AS joined FROM registrations WHERE id = $1",
+      [req.userId]
+    );
     const joined = reg[0] ? reg[0].joined : "0000-00-00";
 
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
     const first = `${year}-${pad(month)}-01`;
     const last = `${year}-${pad(month)}-${pad(daysInMonth)}`;
 
-    const [att] = await pool.execute(
-      `SELECT DATE_FORMAT(attendance_date, '%Y-%m-%d') AS d, status, check_in_time, distance_m
-       FROM attendance WHERE registration_id = ? AND attendance_date BETWEEN ? AND ?`,
-      [req.userId, first, last]);
-    const [hol] = await pool.execute(
-      "SELECT DATE_FORMAT(holiday_date, '%Y-%m-%d') AS d, name FROM public_holidays WHERE holiday_date BETWEEN ? AND ?",
-      [first, last]);
+    const { rows: att } = await pool.query(
+      `SELECT TO_CHAR(attendance_date, 'YYYY-MM-DD') AS d, status, check_in_time, distance_m
+       FROM attendance WHERE registration_id = $1 AND attendance_date BETWEEN $2 AND $3`,
+      [req.userId, first, last]
+    );
+    const { rows: hol } = await pool.query(
+      "SELECT TO_CHAR(holiday_date, 'YYYY-MM-DD') AS d, name FROM public_holidays WHERE holiday_date BETWEEN $1 AND $2",
+      [first, last]
+    );
     const attMap = new Map(att.map((a) => [a.d, a]));
     const holMap = new Map(hol.map((h) => [h.d, h.name]));
 
@@ -357,22 +415,31 @@ app.get("/attendance/calendar", auth, async (req, res) => {
       const dow = weekday(date);
       let type;
       let note = "";
-      if (attMap.has(date)) {                                  // marked by the student
+      if (attMap.has(date)) {
         const a = attMap.get(date);
         type = a.status;
         note = `${a.status} at ${fmt(a.check_in_time)} (${Math.round(Number(a.distance_m))} m from company)`;
         sum.working_days++;
-        if (type === "PRESENT") sum.present++; else sum.absent++;
-      } else if (holMap.has(date)) {                           // public holiday
-        type = "HOLIDAY"; note = holMap.get(date); sum.holidays++;
-      } else if (dow === 0 || dow === 6) {                     // Saturday / Sunday
-        type = "WEEKOFF"; note = dow === 0 ? "Sunday - weekly off" : "Saturday - weekly off"; sum.weekoffs++;
-      } else if (date < joined) {                              // before the student registered
+        if (type === "PRESENT") sum.present++;
+        else sum.absent++;
+      } else if (holMap.has(date)) {
+        type = "HOLIDAY";
+        note = holMap.get(date);
+        sum.holidays++;
+      } else if (dow === 0 || dow === 6) {
+        type = "WEEKOFF";
+        note = dow === 0 ? "Sunday - weekly off" : "Saturday - weekly off";
+        sum.weekoffs++;
+      } else if (date < joined) {
         type = "NONE";
-      } else if (date < today) {                               // working day in the past, not marked
-        type = "ABSENT"; note = "Attendance not marked"; sum.absent++; sum.working_days++;
+      } else if (date < today) {
+        type = "ABSENT";
+        note = "Attendance not marked";
+        sum.absent++;
+        sum.working_days++;
       } else if (date === today) {
-        type = "TODAY"; note = "Today - not marked yet";
+        type = "TODAY";
+        note = "Today - not marked yet";
       } else {
         type = "FUTURE";
       }
@@ -380,9 +447,10 @@ app.get("/attendance/calendar", auth, async (req, res) => {
     }
     sum.percentage = sum.working_days > 0 ? Math.round((sum.present / sum.working_days) * 100) : 0;
 
-    const [trow] = await pool.execute(
-      "SELECT status, check_in_time, distance_m FROM attendance WHERE registration_id = ? AND attendance_date = ?",
-      [req.userId, today]);
+    const { rows: trow } = await pool.query(
+      "SELECT status, check_in_time, distance_m FROM attendance WHERE registration_id = $1 AND attendance_date = $2",
+      [req.userId, today]
+    );
     const t = trow[0];
     const reason = await offReason(today);
 
@@ -406,18 +474,29 @@ app.get("/attendance/calendar", auth, async (req, res) => {
   }
 });
 
-// GET /holidays?year=2026 : the public holidays table
+// GET /holidays?year=2026
 app.get("/holidays", auth, async (req, res) => {
   const today = todayIST();
   const year = Number(req.query.year) || Number(today.slice(0, 4));
   try {
-    const [rows] = await pool.execute(
-      `SELECT DATE_FORMAT(holiday_date, '%Y-%m-%d') AS iso, DATE_FORMAT(holiday_date, '%d %b %Y') AS date,
-              DAYNAME(holiday_date) AS weekday, name
-       FROM public_holidays WHERE YEAR(holiday_date) = ? ORDER BY holiday_date`, [year]);
+    const { rows } = await pool.query(
+      `SELECT TO_CHAR(holiday_date, 'YYYY-MM-DD') AS iso,
+              TO_CHAR(holiday_date, 'DD Mon YYYY') AS date,
+              TRIM(TO_CHAR(holiday_date, 'Day')) AS weekday,
+              name
+       FROM public_holidays
+       WHERE EXTRACT(YEAR FROM holiday_date) = $1
+       ORDER BY holiday_date`,
+      [year]
+    );
     return res.json({
       year,
-      holidays: rows.map((r) => ({ date: r.date, weekday: r.weekday, name: r.name, past: r.iso < today })),
+      holidays: rows.map((r) => ({
+        date: r.date,
+        weekday: r.weekday,
+        name: r.name,
+        past: r.iso < today,
+      })),
     });
   } catch (e) {
     console.error("DB error:", e.message);
@@ -438,48 +517,58 @@ app.post("/attendance/mark", auth, async (req, res) => {
   try {
     const day = todayIST();
 
-    // 1) Public holiday or Saturday / Sunday -> no attendance
     const reason = await offReason(day);
     if (reason) return res.status(400).json({ error: `${reason}. Attendance cannot be marked.` });
 
-    // 2) GPS checks
     if (BLOCK_MOCK && req.body?.mock) {
       return res.status(403).json({ error: "Fake / mock location detected. Attendance not marked." });
     }
     if (acc > ACCURACY_LIMIT_M) {
-      return res.status(400).json({ error: `GPS signal is weak (about ${Math.round(acc)} m off). Go to an open area and try again.` });
+      return res.status(400).json({
+        error: `GPS signal is weak (about ${Math.round(acc)} m off). Go to an open area and try again.`,
+      });
     }
 
-    const [crows] = await pool.execute("SELECT id, company_name, latitude, longitude, radius_m FROM company_location ORDER BY id LIMIT 1");
-    if (!crows.length) return res.status(500).json({ error: "Company location is not set in the database" });
+    const { rows: crows } = await pool.query(
+      "SELECT id, company_name, latitude, longitude, radius_m FROM company_location ORDER BY id LIMIT 1"
+    );
+    if (!crows.length)
+      return res.status(500).json({ error: "Company location is not set in the database" });
     const c = crows[0];
 
-    const [existing] = await pool.execute(
-      "SELECT status FROM attendance WHERE registration_id = ? AND attendance_date = ?", [req.userId, day]);
+    const { rows: existing } = await pool.query(
+      "SELECT status FROM attendance WHERE registration_id = $1 AND attendance_date = $2",
+      [req.userId, day]
+    );
     if (existing.length && existing[0].status === "PRESENT") {
       return res.json({ status: "PRESENT", message: "You are already marked PRESENT today." });
     }
 
-    // 3) Distance from the company -> PRESENT or ABSENT
     const dist = distanceMeters(lat, lng, Number(c.latitude), Number(c.longitude));
     const status = dist <= c.radius_m ? "PRESENT" : "ABSENT";
 
-    await pool.execute(
+    await pool.query(
       `INSERT INTO attendance (registration_id, company_id, attendance_date, status, latitude, longitude, distance_m, accuracy_m)
-       VALUES (?,?,?,?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE status = VALUES(status), check_in_time = CURRENT_TIMESTAMP,
-         latitude = VALUES(latitude), longitude = VALUES(longitude),
-         distance_m = VALUES(distance_m), accuracy_m = VALUES(accuracy_m)`,
-      [req.userId, c.id, day, status, lat, lng, dist.toFixed(1), acc.toFixed(1)]);
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (registration_id, attendance_date) DO UPDATE SET
+         status = EXCLUDED.status,
+         check_in_time = CURRENT_TIMESTAMP,
+         latitude = EXCLUDED.latitude,
+         longitude = EXCLUDED.longitude,
+         distance_m = EXCLUDED.distance_m,
+         accuracy_m = EXCLUDED.accuracy_m`,
+      [req.userId, c.id, day, status, lat, lng, dist.toFixed(1), acc.toFixed(1)]
+    );
 
     const meters = Math.round(dist);
     return res.json({
       status,
       distance_m: meters,
       radius_m: c.radius_m,
-      message: status === "PRESENT"
-        ? `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`
-        : `You are ${meters} m away from ${c.company_name} (allowed: ${c.radius_m} m). Marked ABSENT. Move closer and try again.`,
+      message:
+        status === "PRESENT"
+          ? `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`
+          : `You are ${meters} m away from ${c.company_name} (allowed: ${c.radius_m} m). Marked ABSENT. Move closer and try again.`,
     });
   } catch (e) {
     console.error("DB error:", e.message);
@@ -492,7 +581,11 @@ app.use((err, req, res, next) => {
   res.status(400).json({ error: "Invalid request" });
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on http://127.0.0.1:${PORT}  (keep this window open)`);
-});
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://127.0.0.1:${PORT}`);
+  });
+}
+
+module.exports = app;
