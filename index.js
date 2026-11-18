@@ -15,9 +15,14 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" })); // photo / file uploads come as base64
 
+// ---- Clean DATABASE_URL just in case it has quotes or psql prefix ----
+const rawDbUrl = (process.env.DATABASE_URL || "")
+  .trim()
+  .replace(/^psql\s+['"]?|['"]$/g, "");
+
 // ---- Neon PostgreSQL connection (DATABASE_URL from Vercel / .env) ----
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: rawDbUrl,
   ssl: { rejectUnauthorized: false },
 });
 
@@ -30,7 +35,11 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // Health check route for browser testing
 app.get("/", (req, res) => {
-  res.json({ status: "OK", message: "AR Infotek Backend is running on Vercel + Neon!" });
+  res.json({
+    status: "OK",
+    message: "AR Infotek Backend is running on Vercel + Neon!",
+    db_configured: Boolean(rawDbUrl),
+  });
 });
 
 // Checks the login token sent by the app
@@ -116,7 +125,7 @@ app.post("/register", async (req, res) => {
       return res.status(409).json({ error: "This email or phone is already registered" });
     }
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -150,7 +159,7 @@ app.post("/login", async (req, res) => {
     return res.json({ message: "Login successful", name: user.full_name, token });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -204,7 +213,7 @@ app.get("/profile", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -254,7 +263,7 @@ app.put("/profile", auth, async (req, res) => {
   } catch (e) {
     if (e.code === "23505") return res.status(409).json({ error: "This phone number is already used" });
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -274,7 +283,7 @@ app.post("/profile/photo", auth, async (req, res) => {
     return res.json({ message: "Photo updated" });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -304,7 +313,7 @@ app.post("/profile/files", auth, async (req, res) => {
     return res.status(201).json({ message: "File uploaded" });
   } catch (e) {
     console.error("Upload error:", e.message);
-    return res.status(500).json({ error: "Could not save the file" });
+    return res.status(500).json({ error: e.message || "Could not save the file" });
   }
 });
 
@@ -323,7 +332,7 @@ app.delete("/profile/files/:id", auth, async (req, res) => {
     return res.json({ message: "File deleted" });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -470,7 +479,7 @@ app.get("/attendance/calendar", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -500,7 +509,7 @@ app.get("/holidays", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
@@ -572,7 +581,7 @@ app.post("/attendance/mark", auth, async (req, res) => {
     });
   } catch (e) {
     console.error("DB error:", e.message);
-    return res.status(500).json({ error: "Database error" });
+    return res.status(500).json({ error: e.message || "Database error" });
   }
 });
 
