@@ -556,6 +556,15 @@ app.post("/attendance/mark", auth, async (req, res) => {
     const dist = distanceMeters(lat, lng, Number(c.latitude), Number(c.longitude));
     const status = dist <= c.radius_m ? "PRESENT" : "ABSENT";
 
+    if (status !== "PRESENT") {
+  return res.status(200).json({
+    success: false,
+    status: "ABSENT",
+    distance_m,
+    message: `You are ${distance_m} m away from AR INFOTEK (allowed: ${allowedRadius} m). Move closer and try again.`
+  });
+}
+
     await pool.query(
       `INSERT INTO attendance (registration_id, company_id, attendance_date, status, latitude, longitude, distance_m, accuracy_m)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
