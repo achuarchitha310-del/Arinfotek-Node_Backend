@@ -163,6 +163,118 @@ app.post("/login", async (req, res) => {
   }
 });
 
+// ================= PASSWORD RESET (EMAIL OTP VIA RESEND) =================
+
+// ---- POST /forgot-password : { email } ----
+app.post("/forgot-password", async (req, res) => {
+  const email = String(req.body?.email ?? "").trim().toLowerCase();
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Please enter a valid registered email" });
+  }
+  if (!process.env.RESEND_API_KEY) {
+    return res.status(500).json({ error: "Email service (RESEND_API_KEY) is not configured" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, full_name, email FROM registrations WHERE LOWER(email) = $1 LIMIT 1",
+      [email]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "This email is not registered" });
+    }
+
+    const user = rows[0];
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expires = new Date(Date.now() + 10 * 60 * 1000); // valid for 10 minutes
+
+    await pool.query(
+      "UPDATE registrations SET reset_otp = $1, reset_otp_expires = $2 WHERE id = $3",
+      [otp, expires, user.id]
+    );
+
+    const mailRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "AR INFOTEK <onboarding@resend.dev>",
+        to: [user.email],
+        subject: "AR INFOTEK - Password Reset OTP",
+        html: `
+          <div style="font-family:Arial,sans-serif;padding:20px;max-width:480px;margin:auto;border:1px solid #e2e8f0;border-radius:12px;">
+            <h2 style="color:#1E5AA8;margin-bottom:8px;">AR INFOTEK</h2>
+            <p>Hello <b>${user.full_name}</b>,</p>
+            <p>Use the 6-digit OTP below to reset your password:</p>
+            <div style="background:#f1f5f9;padding:14px;text-align:center;border-radius:8px;font-size:28px;font-weight:bold;letter-spacing:6px;color:#0f172a;margin:16px 0;">
+              ${otp}
+            </div>
+            <p style="color:#64748b;font-size:13px;">This OTP expires in 10 minutes. If you didn't request a password reset, ignore this email.</p>
+          </div>
+        `,
+      }),
+    });
+
+    const mailData = await mailRes.json().catch(() => ({}));
+    if (!mailRes.ok) {
+      console.error("Resend error:", mailData);
+      return res.status(500).json({
+        error: mailData.message || "Failed to send OTP email",
+      });
+    }
+
+    return res.json({ message: `OTP sent to ${user.email}` });
+  } catch (e) {
+    console.error("Forgot password error:", e.message);
+    return res.status(500).json({ error: e.message || "Server error" });
+  }
+});
+
+// ---- POST /reset-password : { email, otp, new_password } ----
+app.post("/reset-password", async (req, res) => {
+  const email = String(req.body?.email ?? "").trim().toLowerCase();
+  const otp = String(req.body?.otp ?? "").trim();
+  const newPassword = String(req.body?.new_password ?? "");
+
+  if (!email || !otp || !newPassword) {
+    return res.status(400).json({ error: "Email, OTP, and new password are required" });
+  }
+  if (newPassword.length < 4) {
+    return res.status(400).json({ error: "New password must be at least 4 characters" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, reset_otp, reset_otp_expires FROM registrations WHERE LOWER(email) = $1 LIMIT 1",
+      [email]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    const user = rows[0];
+    if (!user.reset_otp || user.reset_otp !== otp) {
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+    if (!user.reset_otp_expires || new Date() > new Date(user.reset_otp_expires)) {
+      return res.status(400).json({ error: "OTP expired. Please request a new OTP" });
+    }
+
+    const newHash = await hashPassword(newPassword);
+    await pool.query(
+      "UPDATE registrations SET password_hash = $1, reset_otp = NULL, reset_otp_expires = NULL WHERE id = $2",
+      [newHash, user.id]
+    );
+
+    return res.json({ message: "Password updated successfully! Please login." });
+  } catch (e) {
+    console.error("Reset password error:", e.message);
+    return res.status(500).json({ error: e.message || "Server error" });
+  }
+});
+
 // ================= STUDENT PROFILE =================
 
 // GET /profile
@@ -554,16 +666,17 @@ app.post("/attendance/mark", auth, async (req, res) => {
     }
 
     const dist = distanceMeters(lat, lng, Number(c.latitude), Number(c.longitude));
+    const meters = Math.round(dist);
     const status = dist <= c.radius_m ? "PRESENT" : "ABSENT";
 
     if (status !== "PRESENT") {
-  return res.status(200).json({
-    success: false,
-    status: "ABSENT",
-    distance_m,
-    message: `You are ${distance_m} m away from AR INFOTEK (allowed: ${allowedRadius} m). Move closer and try again.`
-  });
-}
+      return res.status(200).json({
+        success: false,
+        status: "ABSENT",
+        distance_m: meters,
+        message: `You are ${meters} m away from ${c.company_name} (allowed: ${c.radius_m} m). Move closer and try again.`,
+      });
+    }
 
     await pool.query(
       `INSERT INTO attendance (registration_id, company_id, attendance_date, status, latitude, longitude, distance_m, accuracy_m)
@@ -578,15 +691,11 @@ app.post("/attendance/mark", auth, async (req, res) => {
       [req.userId, c.id, day, status, lat, lng, dist.toFixed(1), acc.toFixed(1)]
     );
 
-    const meters = Math.round(dist);
     return res.json({
       status,
       distance_m: meters,
       radius_m: c.radius_m,
-      message:
-        status === "PRESENT"
-          ? `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`
-          : `You are ${meters} m away from ${c.company_name} (allowed: ${c.radius_m} m). Marked ABSENT. Move closer and try again.`,
+      message: `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`,
     });
   } catch (e) {
     console.error("DB error:", e.message);
