@@ -576,7 +576,7 @@ app.get("/attendance/calendar", auth, async (req, res) => {
     const reason = await offReason(today);
 
     return res.json({
-      company: { name: crows[0].company_name, radius_m: crows[0].radius_m },
+      company: { name: crows[0].company_name, radius_m: Number(crows[0].radius_m) || 30 },
       today: {
         date: today,
         status: t ? t.status : null,
@@ -665,18 +665,13 @@ app.post("/attendance/mark", auth, async (req, res) => {
       return res.json({ status: "PRESENT", message: "You are already marked PRESENT today." });
     }
 
-    const dist = distanceMeters(lat, lng, Number(c.latitude), Number(c.longitude));
-    const meters = Math.round(dist);
-    const status = dist <= c.radius_m ? "PRESENT" : "ABSENT";
+    const companyLat = Number(c.latitude) || 12.75432717;
+    const companyLng = Number(c.longitude) || 77.82871361;
+    const allowedRadius = Number(c.radius_m) || 30;
 
-    if (status !== "PRESENT") {
-      return res.status(200).json({
-        success: false,
-        status: "ABSENT",
-        distance_m: meters,
-        message: `You are ${meters} m away from ${c.company_name} (allowed: ${c.radius_m} m). Move closer and try again.`,
-      });
-    }
+    const dist = distanceMeters(lat, lng, companyLat, companyLng);
+    const meters = Math.round(dist);
+    const status = dist <= allowedRadius ? "PRESENT" : "ABSENT";
 
     await pool.query(
       `INSERT INTO attendance (registration_id, company_id, attendance_date, status, latitude, longitude, distance_m, accuracy_m)
@@ -692,10 +687,14 @@ app.post("/attendance/mark", auth, async (req, res) => {
     );
 
     return res.json({
+      success: status === "PRESENT",
       status,
       distance_m: meters,
-      radius_m: c.radius_m,
-      message: `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`,
+      radius_m: allowedRadius,
+      message:
+        status === "PRESENT"
+          ? `Attendance marked PRESENT. You are ${meters} m from ${c.company_name}.`
+          : `Attendance marked ABSENT. You are ${meters} m away from ${c.company_name} (allowed: ${allowedRadius} m).`,
     });
   } catch (e) {
     console.error("DB error:", e.message);
