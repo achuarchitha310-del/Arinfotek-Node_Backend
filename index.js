@@ -5,9 +5,8 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const jwt = require("jsonwebtoken");
-const fs = require("fs");
 const path = require("path");
-const os = require("os");
+const { put, del } = require("@vercel/blob");
 
 const scrypt = promisify(crypto.scrypt);
 
@@ -27,11 +26,6 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
-// Use /tmp in Vercel serverless environment since root folder is read-only
-const UPLOAD_DIR = process.env.VERCEL
-  ? path.join(os.tmpdir(), "uploads")
-  : path.join(__dirname, "uploads");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // Health check route for browser testing
 app.get("/", (req, res) => {
@@ -301,7 +295,7 @@ app.get("/profile", auth, async (req, res) => {
       [req.userId]
     );
     const { rows: files } = await pool.query(
-      "SELECT id, file_name, file_size, uploaded_at FROM student_files WHERE registration_id = $1 ORDER BY id DESC",
+      "SELECT id, file_name, file_path, file_size, uploaded_at FROM student_files WHERE registration_id = $1 ORDER BY id DESC",
       [req.userId]
     );
 
@@ -319,6 +313,7 @@ app.get("/profile", auth, async (req, res) => {
       files: files.map((f) => ({
         id: f.id,
         file_name: f.file_name,
+        file_url: f.file_path,
         file_size: f.file_size,
         uploaded_at: fmt(f.uploaded_at),
       })),
@@ -399,37 +394,43 @@ app.post("/profile/photo", auth, async (req, res) => {
   }
 });
 
-// POST /profile/files : { file_name, data: "<base64>" }
+// POST /profile/files : { file_name, data: "<base64>" } -> Stored in Vercel Blob (Max 100 KB)
 app.post("/profile/files", auth, async (req, res) => {
   const name = String(req.body?.file_name ?? "").trim();
   const buf = Buffer.from(String(req.body?.data ?? ""), "base64");
   const ext = path.extname(name).toLowerCase();
 
-  if (!name || !buf.length) return res.status(400).json({ error: "No file received" });
+  if (!name || !buf.length) {
+    return res.status(400).json({ error: "No file received" });
+  }
   if (![".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".txt"].includes(ext)) {
     return res.status(400).json({ error: "Only PDF, DOC, DOCX, PNG, JPG and TXT files are allowed" });
   }
-  if (buf.length > 5 * 1024 * 1024) return res.status(400).json({ error: "File must be under 5 MB" });
+  if (buf.length > 100 * 1024) {
+    return res.status(400).json({ error: "File size must be under 100 KB" });
+  }
 
   try {
     const safe = name.replace(/[^A-Za-z0-9._-]/g, "_");
-    const folder = path.join(UPLOAD_DIR, String(req.userId));
-    fs.mkdirSync(folder, { recursive: true });
-    const stored = `${Date.now()}_${safe}`;
-    fs.writeFileSync(path.join(folder, stored), buf);
+    const blobPath = `students/${req.userId}/${Date.now()}_${safe}`;
+
+    const blob = await put(blobPath, buf, {
+      access: "public",
+    });
 
     await pool.query(
       "INSERT INTO student_files (registration_id, file_name, file_path, file_size) VALUES ($1,$2,$3,$4)",
-      [req.userId, name.slice(0, 150), `uploads/${req.userId}/${stored}`, buf.length]
+      [req.userId, name.slice(0, 150), blob.url, buf.length]
     );
-    return res.status(201).json({ message: "File uploaded" });
+
+    return res.status(201).json({ message: "File uploaded", url: blob.url });
   } catch (e) {
-    console.error("Upload error:", e.message);
-    return res.status(500).json({ error: e.message || "Could not save the file" });
+    console.error("Blob upload error:", e.message);
+    return res.status(500).json({ error: e.message || "Could not upload the file" });
   }
 });
 
-// DELETE /profile/files/:id
+// DELETE /profile/files/:id -> Deletes from Vercel Blob + Neon DB
 app.delete("/profile/files/:id", auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -438,12 +439,14 @@ app.delete("/profile/files/:id", auth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: "File not found" });
 
-    const baseDir = process.env.VERCEL ? os.tmpdir() : __dirname;
-    fs.rmSync(path.join(baseDir, rows[0].file_path), { force: true });
+    if (rows[0].file_path && rows[0].file_path.startsWith("http")) {
+      await del(rows[0].file_path);
+    }
+
     await pool.query("DELETE FROM student_files WHERE id = $1", [req.params.id]);
     return res.json({ message: "File deleted" });
   } catch (e) {
-    console.error("DB error:", e.message);
+    console.error("Blob delete error:", e.message);
     return res.status(500).json({ error: e.message || "Database error" });
   }
 });
