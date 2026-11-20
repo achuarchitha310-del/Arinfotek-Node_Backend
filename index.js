@@ -394,7 +394,7 @@ app.post("/profile/photo", auth, async (req, res) => {
   }
 });
 
-// POST /profile/files : { file_name, data: "<base64>" } -> Stored in Vercel Blob (Max 100 KB)
+// POST /profile/files : { file_name, data: "<base64>" } -> Stored in Vercel Blob (Max 200 KB)
 app.post("/profile/files", auth, async (req, res) => {
   const name = String(req.body?.file_name ?? "").trim();
   const buf = Buffer.from(String(req.body?.data ?? ""), "base64");
@@ -406,8 +406,8 @@ app.post("/profile/files", auth, async (req, res) => {
   if (![".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".txt"].includes(ext)) {
     return res.status(400).json({ error: "Only PDF, DOC, DOCX, PNG, JPG and TXT files are allowed" });
   }
-  if (buf.length > 100 * 1024) {
-    return res.status(400).json({ error: "File size must be under 100 KB" });
+  if (buf.length > 200 * 1024) {
+    return res.status(400).json({ error: "File size must be under 200 KB" });
   }
 
   try {
